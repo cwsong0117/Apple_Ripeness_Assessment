@@ -16,6 +16,7 @@ from aiortc.codecs import vpx as aiortc_vpx  # Configures VP8/VP9 video bitrate.
 from streamlit_webrtc import WebRtcMode, webrtc_streamer  # Runs browser WebRTC video.
 
 from module.classification import predict_ripeness  # Calls the trained ripeness model.
+from module.object_detection import compute_shape_metrics, is_apple_shape  # Shared apple-shape test.
 from module.Module1.preprocessing import create_apple_candidate_mask  # Finds apple colours.
 
 
@@ -85,13 +86,17 @@ aiortc_h264.DEFAULT_BITRATE = WEBRTC_DEFAULT_BITRATE
 aiortc_h264.MAX_BITRATE = WEBRTC_MAX_BITRATE
 
 
+# Marker stored in a track's history when the model says "this is not an apple".
+_NOT_APPLE = ("__not_apple__", 0.0)
+
+
 @dataclass
 class ApplePrediction:
     """Outcome of the stabilization/confidence check for one tracked apple."""
 
     track_id: int
     bbox: tuple[int, int, int, int]  # x, y, w, h — in full-frame pixel coordinates
-    status: str    # "analyzing" | "low_confidence" | "confirmed"
+    status: str    # "analyzing" | "low_confidence" | "confirmed" | "rejected" (hidden from display)
     message: str = ""
     label: str | None = None
     confidence: float = 0.0
@@ -200,21 +205,17 @@ class ApplePredictionProcessor:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
-            aspect = w / float(h) if h else 0.0
-            hull_area = cv2.contourArea(cv2.convexHull(contour))
-            solidity = area / hull_area if hull_area else 0.0
-            extent = area / float(w * h) if w and h else 0.0
-            perimeter = cv2.arcLength(contour, True)
-            circularity = 4.0 * np.pi * area / (perimeter * perimeter) if perimeter else 0.0
 
             # Apples remain compact and approximately round even when their
-            # colour mask has small gaps. These checks reject hands, leaves,
-            # furniture and narrow background regions.
-            if (
-                0.50 <= aspect <= 1.60
-                and solidity >= 0.72
-                and extent >= 0.48
-                and circularity >= 0.25
+            # colour mask has small gaps. The shared test (which includes a
+            # rotation-invariant elongation limit) rejects hands, leaves,
+            # furniture and narrow background regions. Live video keeps
+            # slightly stricter solidity/extent limits than still images.
+            if is_apple_shape(
+                compute_shape_metrics(contour),
+                min_solidity=0.72,
+                min_circularity=0.25,
+                min_extent=0.48,
             ):
                 candidates.append((area, (x, y, w, h)))
 
@@ -279,6 +280,11 @@ class ApplePredictionProcessor:
             outcome = predict_ripeness(roi)
         except (FileNotFoundError, ValueError, OSError, RuntimeError):
             return None
+
+        # The model recognised a leaf, hand or other non-apple. Record that
+        # explicitly (not as "unreliable") so the track can be hidden.
+        if not outcome.get("is_apple", True):
+            return _NOT_APPLE
 
         return outcome["label"], outcome["confidence"]
 
@@ -417,7 +423,9 @@ class ApplePredictionProcessor:
                 outcome = None
             track.recent.append(outcome)
 
-            predictions.append(self._track_prediction(track))
+            prediction = self._track_prediction(track)
+            if prediction.status != "rejected":
+                predictions.append(prediction)
 
         return predictions
 
@@ -428,7 +436,15 @@ class ApplePredictionProcessor:
     def _track_prediction(self, track: _Track) -> ApplePrediction:
         """Convert a track's recent results into one stable display prediction."""
 
-        valid = [item for item in track.recent if item is not None]
+        rejected = sum(1 for item in track.recent if item is _NOT_APPLE)
+        valid = [
+            item for item in track.recent
+            if item is not None and item is not _NOT_APPLE
+        ]
+
+        # Mostly "not an apple" over the recent window: hide this box entirely.
+        if rejected >= 2 and rejected > len(valid):
+            return ApplePrediction(track.id, track.bbox, "rejected")
 
         if len(valid) < 2:
             return ApplePrediction(

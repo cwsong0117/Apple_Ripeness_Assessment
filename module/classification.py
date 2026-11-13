@@ -13,6 +13,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = REPO_ROOT / "Model Training" / "svm_final_model.pkl"
 IMAGE_SIZE = (256, 256)
 
+# Optional seventh class. When the final model is trained with photos of leaves,
+# hands, branches and backgrounds (see Model Training/not_apple_images), the
+# SVM can answer "this is not an apple" instead of forcing one of the six
+# ripeness labels onto it. Must match NOT_APPLE_LABEL in train_final_model.py.
+# A model trained without that class simply never produces it, so behaviour is
+# unchanged until the model is retrained.
+NOT_APPLE_LABEL = "Not Apple"
+# Reject when the model puts at least this much probability on "Not Apple".
+# Comparing against the whole apple side (1 - p) rather than the single best
+# ripeness class matters: a leaf's apple probability is split across six
+# ripeness classes, so no single one of them would ever beat "Not Apple".
+NOT_APPLE_REJECT_PROBABILITY = 0.5
+
 
 def _validate_image(image: np.ndarray) -> None:
     if image is None or image.size == 0:
@@ -115,17 +128,34 @@ def predict_ripeness(image: np.ndarray, *, fast: bool = False) -> dict:
 
     model_input = _prepare_image(image, fast=fast)
     probabilities = model.predict_proba(model_input)[0]
-    predicted_index = int(np.argmax(probabilities))
     classes = list(encoder.classes_)
-    predicted_label = classes[predicted_index]
-    confidence = float(probabilities[predicted_index])
 
     class_probabilities = {
         label: float(probabilities[index]) for index, label in enumerate(classes)
     }
 
+    # Split off the optional "Not Apple" class so the label, confidence and
+    # probabilities seen by the UI and report stay purely about ripeness.
+    has_not_apple_class = NOT_APPLE_LABEL in class_probabilities
+    not_apple_probability = class_probabilities.pop(NOT_APPLE_LABEL, 0.0)
+    is_apple = not_apple_probability < NOT_APPLE_REJECT_PROBABILITY
+
+    if has_not_apple_class:
+        # Renormalise over the ripeness classes so they again sum to 1.
+        apple_total = sum(class_probabilities.values())
+        if apple_total > 0:
+            class_probabilities = {
+                label: probability / apple_total
+                for label, probability in class_probabilities.items()
+            }
+
+    predicted_label = max(class_probabilities, key=class_probabilities.get)
+    confidence = class_probabilities[predicted_label]
+
     return {
         "label": predicted_label,
         "confidence": confidence,
         "probabilities": class_probabilities,
+        "is_apple": is_apple,
+        "not_apple_probability": not_apple_probability,
     }

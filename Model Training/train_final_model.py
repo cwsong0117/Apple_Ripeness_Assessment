@@ -106,12 +106,21 @@ apply_clahe = _preprocessing.apply_clahe
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATASET_DIR = Path(
-    r"C:\Users\jecsh\OneDrive\Desktop\RSW Y3S1\Apple_Ripeness_Assessment"
-    r"\Apple Ripeness Levels Image Dataset"
-)
-
 OUTPUT_DIR = Path(__file__).resolve().parent
+
+# Relative to the repository so the script runs on any machine.
+DATASET_DIR = OUTPUT_DIR.parent / "Apple Ripeness Levels Image Dataset"
+
+# OPTIONAL "Not Apple" class. Put photos of things the detector must NOT report
+# as apples (leaves, branches, hands, empty backgrounds, other fruit) in this
+# folder. It is deliberately kept OUTSIDE DATASET_DIR so the six-class
+# evaluation scripts (SVM.py, RandomForest.py, CNN.py, compare_model.py) and
+# the accuracy figures reported from them are unchanged.
+# Must match NOT_APPLE_LABEL in module/classification.py.
+NEGATIVES_DIR = OUTPUT_DIR / "not_apple_images"
+NOT_APPLE_LABEL = "Not Apple"
+MIN_NEGATIVES_WARNING = 60
+NOT_APPLE_REJECT_PROBABILITY = 0.5  # same rule the app uses
 FINAL_MODEL_PATH = OUTPUT_DIR / "svm_final_model.pkl"  # saved in module/ so predict.py finds it easily
 
 IMAGE_SIZE = (256, 256)
@@ -193,23 +202,82 @@ def load_dataset(dataset_dir: Path) -> tuple[np.ndarray, np.ndarray]:
 
     X, y = [], []
     for class_dir in class_dirs:
-        label = class_dir.name
-        image_paths = [p for p in class_dir.iterdir() if p.suffix.lower() in VALID_EXTENSIONS]
-        print(f"  Class '{label}': {len(image_paths)} images")
-
-        for img_path in image_paths:
-            image = load_image(img_path)
-            if image is None:
-                continue
-            try:
-                processed = preprocess_image(image)
-                features = extract_features(processed)
-            except Exception:
-                continue
-            X.append(features)
-            y.append(label)
+        _load_class_images(class_dir, class_dir.name, X, y)
 
     return np.array(X), np.array(y)
+
+
+def _load_class_images(class_dir: Path, label: str, X: list, y: list) -> int:
+    """Extract features for every image in ``class_dir`` and append them with ``label``."""
+    image_paths = [p for p in class_dir.iterdir() if p.suffix.lower() in VALID_EXTENSIONS]
+    print(f"  Class '{label}': {len(image_paths)} images")
+
+    loaded = 0
+    for img_path in image_paths:
+        image = load_image(img_path)
+        if image is None:
+            continue
+        try:
+            processed = preprocess_image(image)
+            features = extract_features(processed)
+        except Exception:
+            continue
+        X.append(features)
+        y.append(label)
+        loaded += 1
+    return loaded
+
+
+def add_negatives(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Append the optional "Not Apple" images, if the folder has any."""
+    if not NEGATIVES_DIR.exists():
+        print(f"No '{NOT_APPLE_LABEL}' folder ({NEGATIVES_DIR.name}) - training six ripeness classes only.")
+        return X, y
+
+    neg_X, neg_y = [], []
+    count = _load_class_images(NEGATIVES_DIR, NOT_APPLE_LABEL, neg_X, neg_y)
+    if count == 0:
+        print(f"'{NEGATIVES_DIR.name}' has no usable images - training six ripeness classes only.")
+        return X, y
+
+    if count < MIN_NEGATIVES_WARNING:
+        print(f"  WARNING: only {count} '{NOT_APPLE_LABEL}' images. "
+              f"Aim for roughly 100 (one apple class has ~100) or the class will be unreliable.")
+
+    return np.vstack([X, np.array(neg_X)]), np.concatenate([y, np.array(neg_y)])
+
+
+def report_not_apple_quality(pipeline: Pipeline, X: np.ndarray, y_encoded: np.ndarray,
+                             encoder: LabelEncoder) -> None:
+    """Cross-validated check of the apple / not-apple decision the app will make.
+
+    The final model is fit on everything, so it cannot be scored on its own
+    training data. This 5-fold check uses the same rule as the app: reject when
+    P("Not Apple") >= NOT_APPLE_REJECT_PROBABILITY.
+    """
+    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+
+    not_apple_index = list(encoder.classes_).index(NOT_APPLE_LABEL)
+    is_negative = y_encoded == not_apple_index
+    folds = min(5, int(is_negative.sum()), int((~is_negative).sum()))
+    if folds < 2:
+        print("Too few samples for a cross-validated Not Apple check.")
+        return
+
+    probabilities = cross_val_predict(
+        pipeline, X, y_encoded,
+        cv=StratifiedKFold(n_splits=folds, shuffle=True, random_state=RANDOM_STATE),
+        method="predict_proba",
+    )
+    rejected = probabilities[:, not_apple_index] >= NOT_APPLE_REJECT_PROBABILITY
+
+    caught = rejected[is_negative].mean()
+    wrongly_rejected = rejected[~is_negative].mean()
+    print(f"\n{folds}-fold cross-validated Not Apple check (app's rejection rule):")
+    print(f"  Non-apples correctly rejected : {caught:.1%}  ({int(rejected[is_negative].sum())}/{int(is_negative.sum())})")
+    print(f"  Real apples wrongly rejected  : {wrongly_rejected:.1%}  ({int(rejected[~is_negative].sum())}/{int((~is_negative).sum())})")
+    print("  Rule of thumb: keep wrongly-rejected apples under ~3%; if not, add more varied")
+    print("  Not Apple photos (especially ones that look like your apple photos).")
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +286,8 @@ def load_dataset(dataset_dir: Path) -> tuple[np.ndarray, np.ndarray]:
 def main():
     print("Loading FULL dataset (no train/test split - this is the final model)...")
     X, y = load_dataset(DATASET_DIR)
+    X, y = add_negatives(X, y)
+    has_negatives = NOT_APPLE_LABEL in set(y)
     print(f"\nTotal samples used for final training: {len(X)}\n")
 
     encoder = LabelEncoder()
@@ -234,7 +304,10 @@ def main():
         )),
     ])
 
-    print("Training final SVM on 100% of the dataset...")
+    if has_negatives:
+        report_not_apple_quality(pipeline, X, y_encoded, encoder)
+
+    print("\nTraining final SVM on 100% of the dataset...")
     pipeline.fit(X, y_encoded)
 
     joblib.dump({"model": pipeline, "label_encoder": encoder}, FINAL_MODEL_PATH)

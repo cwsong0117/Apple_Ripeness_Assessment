@@ -28,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from module.Module1.model import PreprocessingResult
 from module.Module1.preprocessing import preprocess_image_with_steps
-from module.object_detection import detect_objects
+from module.object_detection import annotate_apples, detect_objects
 
 
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
@@ -107,6 +107,8 @@ def analyse_image(image_bytes: bytes) -> ImageAnalysis:
     # annotated image that can be displayed in the result panel.
     detected_apples, annotated, _mask, message = detect_objects(processed)
     apple_results: list[AppleResult] = []
+    kept_detections: list[dict] = []
+    rejected_count = 0
 
     # Module 3 is imported here rather than at application startup. If the
     # saved model or one of its dependencies is missing, detection can still
@@ -143,6 +145,14 @@ def analyse_image(image_bytes: bytes) -> ImageAnalysis:
                 # in module/classification.py. It returns the winning class,
                 # confidence, and probabilities for all six ripeness classes.
                 prediction = predict_ripeness(crop)
+
+                # A model trained with a "Not Apple" class can recognise a
+                # leaf, hand or branch the colour/shape tests let through.
+                # Discard it rather than reporting an invented ripeness.
+                if not prediction.get("is_apple", True):
+                    rejected_count += 1
+                    continue
+
                 label = str(prediction["label"])
                 confidence = float(prediction["confidence"])
                 probabilities = {
@@ -165,6 +175,23 @@ def analyse_image(image_bytes: bytes) -> ImageAnalysis:
                 classification_error=classification_error,
             )
         )
+        kept_detections.append(detected_apple)
+
+    # Some detections were discarded as "not an apple": renumber the survivors
+    # and redraw the overlay so the picture and the results stay consistent.
+    if rejected_count:
+        for new_id, (detection, result) in enumerate(
+            zip(kept_detections, apple_results), start=1
+        ):
+            detection["id"] = new_id
+            result.apple_id = new_id
+        annotated = annotate_apples(processed, kept_detections)
+
+        ignored = f"{rejected_count} object(s) ignored: not recognised as an apple."
+        if apple_results:
+            message = f"Apple detected! Found {len(apple_results)} apple(s). {ignored}"
+        else:
+            message = f"No apple found in the image. {ignored}"
 
     # Return one structured object instead of letting the UI depend directly
     # on the internal outputs of every processing module.

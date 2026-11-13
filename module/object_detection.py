@@ -2,7 +2,71 @@ import numpy as np
 import cv2 as cv
 
 # ==========================================
-# 1. ADVANCED OBJECT DETECTION 
+# 0. SHARED APPLE-SHAPE TEST
+# ==========================================
+# Colour alone cannot separate a green apple from a leaf (both fall in the same
+# HSV range), so a candidate must also be compact. A leaf is a long, pointed
+# oval, which the elongation limit below rejects. Both the still-image detector
+# and the live-camera detector use this one test so they cannot drift apart.
+# Known limit: a leaf that is nearly as wide as it is long (elongation < 1.7)
+# still passes; only a "not apple" training class can fix that.
+#
+# Thresholds were calibrated on the dataset's apples (88 sampled images):
+# elongation median 1.08 / 95th percentile 1.45, circularity minimum 0.33,
+# solidity minimum 0.71, extent minimum 0.43. Circularity and solidity cannot
+# separate a smooth oval leaf from an apple (a 2:1 ellipse still scores ~0.8
+# circularity), so the leaf-specific test is MAX_ELONGATION.
+MIN_ASPECT = 0.50
+MAX_ASPECT = 1.60
+MAX_ELONGATION = 1.70
+MIN_SOLIDITY = 0.65
+MIN_CIRCULARITY = 0.30
+MIN_EXTENT = 0.40
+
+
+def compute_shape_metrics(contour: np.ndarray) -> dict:
+    """Measure the shape descriptors used to decide whether a blob is an apple."""
+    area = cv.contourArea(contour)
+    x, y, w, h = cv.boundingRect(contour)
+    perimeter = cv.arcLength(contour, True)
+    hull_area = cv.contourArea(cv.convexHull(contour))
+
+    # Elongation = long side / short side of the minimum-area rotated box.
+    # Unlike the axis-aligned aspect ratio it does not change when the object
+    # is tilted, so a leaf lying diagonally is still recognised as long and thin.
+    (_, _), (rect_w, rect_h), _ = cv.minAreaRect(contour)
+    short_side, long_side = sorted((rect_w, rect_h))
+    elongation = long_side / short_side if short_side > 0 else float("inf")
+
+    return {
+        "area": area,
+        "elongation": elongation,
+        "aspect": w / float(h) if h > 0 else 0.0,
+        "solidity": area / hull_area if hull_area > 0 else 0.0,
+        "circularity": (4.0 * np.pi * area) / (perimeter * perimeter) if perimeter > 0 else 0.0,
+        "extent": area / float(w * h) if w > 0 and h > 0 else 0.0,
+    }
+
+
+def is_apple_shape(
+    metrics: dict,
+    *,
+    min_solidity: float = MIN_SOLIDITY,
+    min_circularity: float = MIN_CIRCULARITY,
+    min_extent: float = MIN_EXTENT,
+) -> bool:
+    """Return True when a blob is compact and round enough to be an apple."""
+    return (
+        MIN_ASPECT <= metrics["aspect"] <= MAX_ASPECT
+        and metrics["elongation"] <= MAX_ELONGATION
+        and metrics["solidity"] >= min_solidity
+        and metrics["circularity"] >= min_circularity
+        and metrics["extent"] >= min_extent
+    )
+
+
+# ==========================================
+# 1. ADVANCED OBJECT DETECTION
 # (Integrated with Friend's Config Heuristics)
 # ==========================================
 def detect_objects(segmented_img: np.ndarray):
@@ -62,18 +126,7 @@ def detect_objects(segmented_img: np.ndarray):
                 if not (0.005 * image_area <= area <= 0.70 * image_area):
                     continue
                     
-                x, y, w, h = cv.boundingRect(c)
-                aspect = w / float(h) if h > 0 else 0.0
-                
-                hull = cv.convexHull(c)
-                hull_area = cv.contourArea(hull)
-                solidity = area / hull_area if hull_area > 0 else 0.0
-                
-                perimeter = cv.arcLength(c, True)
-                circularity = (4.0 * np.pi * area) / (perimeter * perimeter) if perimeter > 0 else 0.0
-                
-                # Adjusted thresholds to safely tolerate hands and stems
-                if (0.30 <= aspect <= 1.60) and (solidity >= 0.60) and (circularity >= 0.30):
+                if is_apple_shape(compute_shape_metrics(c)):
                     valid_contours.append(c)
 
     # --- NEW: relative-size filtering ---
@@ -87,43 +140,52 @@ def detect_objects(segmented_img: np.ndarray):
 
     # ❌ REMOVED THE MERGING LOOP THAT WAS EATING THE IMAGE ❌
 
-    annotated_image = image.copy()
-
     if not valid_contours:
-        cv.putText(annotated_image, "No apples found", (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 1)
+        annotated_image = annotate_apples(image, [])
         return [], annotated_image, candidate_mask, "No apple found in the image"
 
     detected_apples = []
 
-    # Annotate all valid apples
     for i, c in enumerate(valid_contours, start=1):
         x, y, w, h = cv.boundingRect(c)
-        cv.drawContours(annotated_image, [c], -1, (0, 255, 0), 2)
-        cv.rectangle(annotated_image, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        cv.putText(annotated_image, f"Apple {i}", (x, max(20, y - 10)), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv.LINE_AA)
 
         # We must also calculate confidence to prevent the UI from crashing
         # Re-calculating stats for the dictionary
-        area = cv.contourArea(c)
-        perimeter = cv.arcLength(c, True)
-        circularity = (4.0 * np.pi * area) / (perimeter * perimeter) if perimeter > 0 else 0.0
-        aspect = w / float(h) if h > 0 else 0.0
-        hull_area = cv.contourArea(cv.convexHull(c))
-        solidity = area / hull_area if hull_area > 0 else 0.0
-        
+        metrics = compute_shape_metrics(c)
+
         detected_apples.append({
             "id": i,
             "bbox": (x, y, w, h),
             "contour": c,
+            "shape": metrics,
             # Pass a baseline confidence score based on solidity so app.py doesn't throw a KeyError
-            "confidence": min(solidity, 1.0),
+            "confidence": min(metrics["solidity"], 1.0),
             "individual_img": image.copy() 
         })
 
+    annotated_image = annotate_apples(image, detected_apples)
+
     total_apples = len(valid_contours)
     status_message = f"Apple detected! Found {total_apples} apple(s)"
-    
+
     return detected_apples, annotated_image, candidate_mask, status_message
+
+
+def annotate_apples(image: np.ndarray, apples: list[dict]) -> np.ndarray:
+    """Draw contour, box and "Apple N" label for each detection on a copy of ``image``."""
+    annotated_image = image.copy()
+
+    if not apples:
+        cv.putText(annotated_image, "No apples found", (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 1)
+        return annotated_image
+
+    for apple in apples:
+        x, y, w, h = apple["bbox"]
+        cv.drawContours(annotated_image, [apple["contour"]], -1, (0, 255, 0), 2)
+        cv.rectangle(annotated_image, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        cv.putText(annotated_image, f"Apple {apple['id']}", (x, max(20, y - 10)), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv.LINE_AA)
+
+    return annotated_image
 
 
 # ==========================================
