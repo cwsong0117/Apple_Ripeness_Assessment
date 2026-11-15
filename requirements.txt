@@ -4,7 +4,7 @@ numpy
 Pillow
 joblib
 scikit-image
-scikit-learn
+scikit-learn==1.9.0
 streamlit-webrtc
 av
 aiortc
