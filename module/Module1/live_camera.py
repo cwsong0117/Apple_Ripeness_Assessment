@@ -16,7 +16,12 @@ from aiortc.codecs import vpx as aiortc_vpx  # Configures VP8/VP9 video bitrate.
 from streamlit_webrtc import WebRtcMode, webrtc_streamer  # Runs browser WebRTC video.
 
 from module.classification import predict_ripeness  # Calls the trained ripeness model.
-from module.object_detection import compute_shape_metrics, is_apple_shape  # Shared apple-shape test.
+from module.object_detection import (  # Shared apple-shape test and stick/leaf trimming.
+    MIN_COMPONENT_FRACTION,
+    compute_shape_metrics,
+    is_apple_shape,
+    trim_thin_attachments,
+)
 from module.Module1.preprocessing import create_apple_candidate_mask  # Finds apple colours.
 
 
@@ -193,11 +198,16 @@ class ApplePredictionProcessor:
         candidate_mask = cv2.morphologyEx(
             candidate_mask, cv2.MORPH_CLOSE, kernel, iterations=2
         )
+        # Cut off sticks, stalks and leaves joined to an apple so the box (and
+        # the crop that gets classified) covers the apple alone.
+        image_area = detection_frame.shape[0] * detection_frame.shape[1]
+        candidate_mask = trim_thin_attachments(
+            candidate_mask, MIN_COMPONENT_FRACTION * image_area
+        )
         contours, _ = cv2.findContours(
             candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        image_area = detection_frame.shape[0] * detection_frame.shape[1]
         candidates: list[tuple[float, tuple[int, int, int, int]]] = []
         for contour in contours:
             area = cv2.contourArea(contour)

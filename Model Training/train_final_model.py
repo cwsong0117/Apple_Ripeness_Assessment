@@ -19,6 +19,15 @@ Why this is separate from SVM.py:
     test set left - that's expected and correct. Your reported accuracy
     figures should come from SVM.py's evaluation runs, not from this script.
 
+What the model is trained on:
+    By default each training photo is first run through the app's own detector
+    (UI/image_pipeline.detect_apples) and the model learns from the crop the
+    app would classify. At prediction time the app only ever sees detector
+    crops, not whole photos, so training on whole photos teaches features such
+    as a stalk or a dried calyx tail that the detector now trims off. If the
+    detector finds nothing in a photo, the whole photo is used instead.
+    Pass --whole-images to reproduce the older whole-photo training.
+
 Output:
     svm_final_model.pkl - saved via joblib, contains the fitted pipeline
     (scaler + SVM) and the label encoder, ready to be loaded by predict.py.
@@ -29,6 +38,7 @@ Requirements:
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -107,9 +117,10 @@ apply_clahe = _preprocessing.apply_clahe
 # Configuration
 # ---------------------------------------------------------------------------
 OUTPUT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = OUTPUT_DIR.parent
 
 # Relative to the repository so the script runs on any machine.
-DATASET_DIR = OUTPUT_DIR.parent / "Apple Ripeness Levels Image Dataset"
+DATASET_DIR = REPO_ROOT / "Apple Ripeness Levels Image Dataset"
 
 # OPTIONAL "Not Apple" class. Put photos of things the detector must NOT report
 # as apples (leaves, branches, hands, empty backgrounds, other fruit) in this
@@ -193,7 +204,37 @@ def load_image(path: Path) -> np.ndarray | None:
     return cv2.resize(image, IMAGE_SIZE)
 
 
-def load_dataset(dataset_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+def detector_crop(path: Path) -> np.ndarray | None:
+    """Return the crop the app would classify for this photo.
+
+    Uses the same detect-and-crop functions as the app, so training crops
+    cannot drift from served crops. Returns None when the detector finds no
+    apple (or the file cannot be read). With several detections the largest is
+    used; each dataset photo shows one ripeness level.
+    """
+    # Imported here so --whole-images does not need the app's modules.
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from UI.image_pipeline import crop_apple, decode_image, detect_apples
+
+    try:
+        preprocessing, _, apples, _, _ = detect_apples(decode_image(path.read_bytes()))
+    except Exception:
+        return None
+    if not apples:
+        return None
+
+    largest = max(apples, key=lambda apple: apple["bbox"][2] * apple["bbox"][3])
+    return crop_apple(preprocessing, tuple(largest["bbox"]))
+
+
+def crop_features(crop: np.ndarray) -> np.ndarray:
+    """Features of a detector crop, computed exactly as module/classification.py does."""
+    resized = cv2.resize(crop, IMAGE_SIZE, interpolation=cv2.INTER_AREA)
+    return extract_features(preprocess_image(resized))
+
+
+def load_dataset(dataset_dir: Path, use_crops: bool = True) -> tuple[np.ndarray, np.ndarray]:
     if not dataset_dir.exists():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
 
@@ -202,40 +243,48 @@ def load_dataset(dataset_dir: Path) -> tuple[np.ndarray, np.ndarray]:
 
     X, y = [], []
     for class_dir in class_dirs:
-        _load_class_images(class_dir, class_dir.name, X, y)
+        _load_class_images(class_dir, class_dir.name, X, y, use_crops)
 
     return np.array(X), np.array(y)
 
 
-def _load_class_images(class_dir: Path, label: str, X: list, y: list) -> int:
+def _load_class_images(class_dir: Path, label: str, X: list, y: list,
+                       use_crops: bool = True) -> int:
     """Extract features for every image in ``class_dir`` and append them with ``label``."""
     image_paths = [p for p in class_dir.iterdir() if p.suffix.lower() in VALID_EXTENSIONS]
-    print(f"  Class '{label}': {len(image_paths)} images")
 
-    loaded = 0
+    loaded = cropped = 0
     for img_path in image_paths:
-        image = load_image(img_path)
-        if image is None:
-            continue
         try:
-            processed = preprocess_image(image)
-            features = extract_features(processed)
+            crop = detector_crop(img_path) if use_crops else None
+            if crop is not None:
+                features = crop_features(crop)
+                cropped += 1
+            else:
+                image = load_image(img_path)
+                if image is None:
+                    continue
+                features = extract_features(preprocess_image(image))
         except Exception:
             continue
         X.append(features)
         y.append(label)
         loaded += 1
+
+    detail = f" ({cropped} detector crops, {loaded - cropped} whole photos)" if use_crops else ""
+    print(f"  Class '{label}': {loaded}/{len(image_paths)} images{detail}")
     return loaded
 
 
-def add_negatives(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def add_negatives(X: np.ndarray, y: np.ndarray,
+                  use_crops: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """Append the optional "Not Apple" images, if the folder has any."""
     if not NEGATIVES_DIR.exists():
         print(f"No '{NOT_APPLE_LABEL}' folder ({NEGATIVES_DIR.name}) - training six ripeness classes only.")
         return X, y
 
     neg_X, neg_y = [], []
-    count = _load_class_images(NEGATIVES_DIR, NOT_APPLE_LABEL, neg_X, neg_y)
+    count = _load_class_images(NEGATIVES_DIR, NOT_APPLE_LABEL, neg_X, neg_y, use_crops)
     if count == 0:
         print(f"'{NEGATIVES_DIR.name}' has no usable images - training six ripeness classes only.")
         return X, y
@@ -284,9 +333,22 @@ def report_not_apple_quality(pipeline: Pipeline, X: np.ndarray, y_encoded: np.nd
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    print("Loading FULL dataset (no train/test split - this is the final model)...")
-    X, y = load_dataset(DATASET_DIR)
-    X, y = add_negatives(X, y)
+    parser = argparse.ArgumentParser(description="Train the final deployable SVM.")
+    parser.add_argument(
+        "--whole-images", action="store_true",
+        help="train on whole photos instead of the detector's crops (the older behaviour)",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=FINAL_MODEL_PATH,
+        help=f"where to save the model (default: {FINAL_MODEL_PATH.name} next to this script)",
+    )
+    args = parser.parse_args()
+    use_crops = not args.whole_images
+
+    source = "detector crops" if use_crops else "whole photos"
+    print(f"Loading FULL dataset as {source} (no train/test split - this is the final model)...")
+    X, y = load_dataset(DATASET_DIR, use_crops)
+    X, y = add_negatives(X, y, use_crops)
     has_negatives = NOT_APPLE_LABEL in set(y)
     print(f"\nTotal samples used for final training: {len(X)}\n")
 
@@ -310,8 +372,8 @@ def main():
     print("\nTraining final SVM on 100% of the dataset...")
     pipeline.fit(X, y_encoded)
 
-    joblib.dump({"model": pipeline, "label_encoder": encoder}, FINAL_MODEL_PATH)
-    print(f"\nFinal deployable model saved to: {FINAL_MODEL_PATH}")
+    joblib.dump({"model": pipeline, "label_encoder": encoder}, args.output)
+    print(f"\nFinal deployable model saved to: {args.output}")
     print("This model has seen every image in the dataset and is ready for predict.py.")
 
 

@@ -89,11 +89,18 @@ def _white_segmented_background(
     return cv2.copyTo(image, foreground_mask, white_background)
 
 
-def analyse_image(image_bytes: bytes) -> ImageAnalysis:
-    """Run preprocessing, detection, and classification on one image."""
-    # Module 1: convert browser bytes to OpenCV BGR and create every
-    # preprocessing/segmentation stage used by the UI's stage viewer.
-    source = decode_image(image_bytes)
+def detect_apples(
+    source: np.ndarray,
+) -> tuple[PreprocessingResult, np.ndarray, list[dict], np.ndarray, str]:
+    """Run Module 1 preprocessing and Module 2 detection on a decoded image.
+
+    Returns ``(preprocessing, processed, detections, annotated, message)``.
+    Kept separate from :func:`analyse_image` so that
+    ``Model Training/train_final_model.py`` can build its training crops with
+    exactly the code the app uses, instead of a copy that could drift.
+    """
+    # Module 1: create every preprocessing/segmentation stage used by the UI's
+    # stage viewer.
     preprocessing = preprocess_image_with_steps(source)
     processed = preprocessing.final
 
@@ -106,6 +113,28 @@ def analyse_image(image_bytes: bytes) -> ImageAnalysis:
     # Module 2: locate apples and return a bounding box for each one, plus an
     # annotated image that can be displayed in the result panel.
     detected_apples, annotated, _mask, message = detect_objects(processed)
+    return preprocessing, processed, detected_apples, annotated, message
+
+
+def crop_apple(
+    preprocessing: PreprocessingResult,
+    bbox: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Cut one detection out of the clean, resized image for classification.
+
+    Classification performs its own preprocessing, so the crop comes from the
+    resized image rather than the processed one: contrast enhancement and
+    segmentation are then not accidentally applied twice.
+    """
+    x, y, width, height = bbox
+    return np.ascontiguousarray(preprocessing.resized[y:y + height, x:x + width])
+
+
+def analyse_image(image_bytes: bytes) -> ImageAnalysis:
+    """Run preprocessing, detection, and classification on one image."""
+    # Modules 1 and 2: decode the browser bytes, then preprocess and detect.
+    source = decode_image(image_bytes)
+    preprocessing, processed, detected_apples, annotated, message = detect_apples(source)
     apple_results: list[AppleResult] = []
     kept_detections: list[dict] = []
     rejected_count = 0
@@ -127,12 +156,8 @@ def analyse_image(image_bytes: bytes) -> ImageAnalysis:
         x, y, width, height = detected_apple["bbox"]
         apple_id = int(detected_apple["id"])
 
-        # Classification performs its own preprocessing. Use the clean,
-        # resized crop so contrast enhancement and segmentation are not
-        # accidentally applied twice.
-        crop = np.ascontiguousarray(
-            preprocessing.resized[y:y + height, x:x + width]
-        )
+        # Classification performs its own preprocessing (see crop_apple).
+        crop = crop_apple(preprocessing, (x, y, width, height))
 
         label = "Unavailable"
         confidence = 0.0
